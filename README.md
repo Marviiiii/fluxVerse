@@ -126,7 +126,3 @@ contracts/
 ## Contact
 
 For questions or collaboration, open an issue or reach out via GitHub.
-
----
-
-**Happy hacking with FluxVerse!**
