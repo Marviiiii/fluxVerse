@@ -1,5 +1,6 @@
 ;; FluxVerse CDP (Collateralized Debt Position) Contract
 ;; Allows users to deposit STX as collateral and borrow FLUX tokens
+;; Enhanced with governance and partial liquidation features
 
 ;; Error constants
 (define-constant ERR-NO-VAULT u100)
@@ -15,13 +16,37 @@
 (define-constant ERR-INVALID-INPUT u110)
 (define-constant ERR-ARITHMETIC-OVERFLOW u111)
 
-;; System parameters
-(define-constant MIN-COLLATERAL-RATIO u150) ;; 150%
-(define-constant LIQUIDATION-RATIO u130)    ;; 130%
-(define-constant LIQUIDATION-BONUS u10)     ;; 10%
-(define-constant INTEREST-RATE-BP u500)     ;; 5.00% annualized, in basis points
+;; New error constants for governance and liquidation
+(define-constant ERR-PROPOSAL-NOT-FOUND u112)
+(define-constant ERR-PROPOSAL-EXPIRED u113)
+(define-constant ERR-ALREADY-VOTED u114)
+(define-constant ERR-INSUFFICIENT-VOTING-POWER u115)
+(define-constant ERR-PROPOSAL-NOT-PASSED u116)
+(define-constant ERR-LIQUIDATION-TOO-LARGE u117)
+(define-constant ERR-AUCTION-NOT-ACTIVE u118)
+(define-constant ERR-BID-TOO-LOW u119)
+(define-constant ERR-AUCTION-EXISTS u120)
+(define-constant ERR-INSUFFICIENT-QUORUM u121)
+(define-constant ERR-PROPOSAL-ALREADY-EXECUTED u122)
+
+;; System parameters (now variables for governance)
+(define-data-var min-collateral-ratio uint u150) ;; 150%
+(define-data-var liquidation-ratio uint u130)    ;; 130%
+(define-data-var liquidation-bonus uint u10)     ;; 10%
+(define-data-var interest-rate-bp uint u500)     ;; 5.00% annualized, in basis points
+
+;; Fixed constants
 (define-constant BLOCKS-PER-YEAR u52560)    ;; Assuming ~10 min blocks
 (define-constant PRECISION u1000000)        ;; 6 decimal precision for calculations
+
+;; Governance parameters
+(define-constant VOTING-PERIOD u1008) ;; ~1 week in blocks
+(define-constant PROPOSAL-THRESHOLD u100000) ;; 100K FLUX tokens to propose
+(define-constant QUORUM-THRESHOLD u500000) ;; 500K FLUX tokens for quorum
+
+;; Liquidation parameters
+(define-constant MAX-LIQUIDATION-RATIO u50) ;; Max 50% of debt can be liquidated at once
+(define-constant AUCTION-DURATION u72) ;; ~12 hours in blocks
 
 ;; Maximum values to prevent overflow
 (define-constant MAX-UINT u340282366920938463463374607431768211455)
@@ -39,6 +64,12 @@
 (define-data-var stx-price uint u1000000) ;; $1.00 in micro-dollars (6 decimals)
 (define-data-var flux-price uint u1000000) ;; $1.00 in micro-dollars (6 decimals)
 
+;; Governance data
+(define-data-var proposal-count uint u0)
+
+;; Liquidation auction data
+(define-data-var auction-count uint u0)
+
 ;; Vault data structure
 (define-map vaults principal
   {
@@ -47,6 +78,36 @@
     last-block: uint  ;; last interest calculation block
   }
 )
+
+;; Governance proposal structure
+(define-map proposals uint {
+  proposer: principal,
+  parameter: (string-ascii 32),
+  new-value: uint,
+  votes-for: uint,
+  votes-against: uint,
+  start-block: uint,
+  end-block: uint,
+  executed: bool
+})
+
+;; User votes tracking
+(define-map user-votes {proposal-id: uint, voter: principal} {
+  amount: uint,
+  support: bool
+})
+
+;; Liquidation auction structure
+(define-map liquidation-auctions uint {
+  vault-owner: principal,
+  debt-to-cover: uint,
+  collateral-for-sale: uint,
+  start-block: uint,
+  end-block: uint,
+  highest-bidder: (optional principal),
+  highest-bid: uint,
+  is-active: bool
+})
 
 ;; Input validation helpers
 (define-private (is-valid-amount (amount uint))
@@ -97,6 +158,35 @@
   )
 )
 
+;; Governance helper functions
+(define-private (is-valid-parameter (param (string-ascii 32)) (value uint))
+  (or 
+    (and (is-eq param "min-collateral-ratio") (and (>= value u110) (<= value u300)))
+    (and (is-eq param "liquidation-ratio") (and (>= value u100) (<= value u150)))
+    (and (is-eq param "liquidation-bonus") (and (>= value u5) (<= value u20)))
+    (and (is-eq param "interest-rate-bp") (and (>= value u0) (<= value u2000)))
+  )
+)
+
+(define-private (update-parameter (param (string-ascii 32)) (value uint))
+  (begin
+    (if (is-eq param "min-collateral-ratio")
+      (var-set min-collateral-ratio value)
+      (if (is-eq param "liquidation-ratio")
+        (var-set liquidation-ratio value)
+        (if (is-eq param "liquidation-bonus")
+          (var-set liquidation-bonus value)
+          (if (is-eq param "interest-rate-bp")
+            (var-set interest-rate-bp value)
+            false
+          )
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
 ;; Read-only functions
 
 (define-read-only (get-vault (owner principal))
@@ -125,7 +215,7 @@
           collateral-ratio: ratio,
           liquidation-price: (if (> (get collateral updated-vault) u0)
                               (unwrap! (safe-div 
-                                (unwrap! (safe-mul debt-value LIQUIDATION-RATIO) (err ERR-ARITHMETIC-OVERFLOW))
+                                (unwrap! (safe-mul debt-value (var-get liquidation-ratio)) (err ERR-ARITHMETIC-OVERFLOW))
                                 (unwrap! (safe-mul (get collateral updated-vault) u100) (err ERR-ARITHMETIC-OVERFLOW))
                               ) (err ERR-ARITHMETIC-OVERFLOW))
                               u0)
@@ -160,6 +250,46 @@
   (var-get contract-owner)
 )
 
+;; Governance read-only functions
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals proposal-id)
+)
+
+(define-read-only (get-user-vote (proposal-id uint) (voter principal))
+  (map-get? user-votes {proposal-id: proposal-id, voter: voter})
+)
+
+(define-read-only (get-system-parameters)
+  {
+    min-collateral-ratio: (var-get min-collateral-ratio),
+    liquidation-ratio: (var-get liquidation-ratio),
+    liquidation-bonus: (var-get liquidation-bonus),
+    interest-rate-bp: (var-get interest-rate-bp)
+  }
+)
+
+;; Liquidation auction read-only functions
+(define-read-only (get-auction (auction-id uint))
+  (map-get? liquidation-auctions auction-id)
+)
+
+(define-read-only (get-current-auction-bonus (auction-id uint))
+  (match (map-get? liquidation-auctions auction-id)
+    auction (let (
+        (elapsed-blocks (- stacks-block-height (get start-block auction)))
+        (total-duration AUCTION-DURATION)
+        (starting-bonus u20)
+        (ending-bonus u5)
+        (bonus-decrease (- starting-bonus ending-bonus))
+      )
+      (if (>= elapsed-blocks total-duration)
+        ending-bonus
+        (- starting-bonus (/ (* bonus-decrease elapsed-blocks) total-duration))
+      ))
+    u0
+  )
+)
+
 ;; Private helper functions
 
 (define-private (calculate-interest-internal (vault {collateral: uint, debt: uint, last-block: uint}))
@@ -170,7 +300,7 @@
       (current-debt (get debt vault))
       (interest (if (> current-debt u0)
                    (let ((numerator (unwrap! (safe-mul 
-                                      (unwrap! (safe-mul current-debt INTEREST-RATE-BP) (err ERR-ARITHMETIC-OVERFLOW))
+                                      (unwrap! (safe-mul current-debt (var-get interest-rate-bp)) (err ERR-ARITHMETIC-OVERFLOW))
                                       blocks-elapsed) (err ERR-ARITHMETIC-OVERFLOW)))
                          (denominator (unwrap! (safe-mul u10000 BLOCKS-PER-YEAR) (err ERR-ARITHMETIC-OVERFLOW))))
                      (unwrap! (safe-div numerator denominator) (err ERR-ARITHMETIC-OVERFLOW)))
@@ -207,7 +337,7 @@
     (if (is-eq debt u0)
         (ok true)
         (let ((collateral-value (unwrap! (get-collateral-value collateral) (err ERR-ARITHMETIC-OVERFLOW)))
-              (min-collateral-value (unwrap! (safe-mul debt MIN-COLLATERAL-RATIO) (err ERR-ARITHMETIC-OVERFLOW))))
+              (min-collateral-value (unwrap! (safe-mul debt (var-get min-collateral-ratio)) (err ERR-ARITHMETIC-OVERFLOW))))
           (ok (>= (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) min-collateral-value))
         )
     )
@@ -249,7 +379,196 @@
   )
 )
 
-;; Public functions
+;; Governance functions
+
+(define-public (propose (parameter (string-ascii 32)) (new-value uint))
+  (let (
+    (proposal-id (+ (var-get proposal-count) u1))
+    (proposer-balance (contract-call? FLUX-TOKEN get-balance tx-sender))
+  )
+    (asserts! (>= proposer-balance PROPOSAL-THRESHOLD) (err ERR-INSUFFICIENT-VOTING-POWER))
+    (asserts! (is-valid-parameter parameter new-value) (err ERR-INVALID-INPUT))
+    
+    (map-set proposals proposal-id {
+      proposer: tx-sender,
+      parameter: parameter,
+      new-value: new-value,
+      votes-for: u0,
+      votes-against: u0,
+      start-block: stacks-block-height,
+      end-block: (+ stacks-block-height VOTING-PERIOD),
+      executed: false
+    })
+    
+    (var-set proposal-count proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote (proposal-id uint) (support bool) (amount uint))
+  (let (
+    (proposal (unwrap! (map-get? proposals proposal-id) (err ERR-PROPOSAL-NOT-FOUND)))
+    (voter-balance (contract-call? FLUX-TOKEN get-balance tx-sender))
+  )
+    (asserts! (<= stacks-block-height (get end-block proposal)) (err ERR-PROPOSAL-EXPIRED))
+    (asserts! (>= voter-balance amount) (err ERR-INSUFFICIENT-VOTING-POWER))
+    (asserts! (is-none (map-get? user-votes {proposal-id: proposal-id, voter: tx-sender})) (err ERR-ALREADY-VOTED))
+    
+    ;; Record the vote
+    (map-set user-votes {proposal-id: proposal-id, voter: tx-sender} {
+      amount: amount,
+      support: support
+    })
+    
+    ;; Update proposal vote counts
+    (if support
+      (map-set proposals proposal-id (merge proposal {votes-for: (+ (get votes-for proposal) amount)}))
+      (map-set proposals proposal-id (merge proposal {votes-against: (+ (get votes-against proposal) amount)}))
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (map-get? proposals proposal-id) (err ERR-PROPOSAL-NOT-FOUND)))
+    (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+    (votes-for (get votes-for proposal))
+    (votes-against (get votes-against proposal))
+    (is-executed (get executed proposal))
+    (end-block (get end-block proposal))
+  )
+    ;; Check if voting period has ended
+    (asserts! (> stacks-block-height end-block) (err ERR-PROPOSAL-EXPIRED))
+    
+    ;; Check if proposal hasn't been executed yet
+    (asserts! (not is-executed) (err ERR-PROPOSAL-ALREADY-EXECUTED))
+    
+    ;; Check if proposal passed (more votes for than against)
+    (asserts! (> votes-for votes-against) (err ERR-PROPOSAL-NOT-PASSED))
+    
+    ;; Check if quorum was reached
+    (asserts! (>= total-votes QUORUM-THRESHOLD) (err ERR-INSUFFICIENT-QUORUM))
+    
+    ;; Execute the parameter change
+    (unwrap-panic (update-parameter (get parameter proposal) (get new-value proposal)))
+    
+    ;; Mark as executed
+    (map-set proposals proposal-id (merge proposal {executed: true}))
+    (ok true)
+  )
+)
+
+;; Enhanced liquidation functions
+
+(define-public (start-partial-liquidation (target principal) (debt-amount uint))
+  (let (
+    (vault (unwrap! (update-vault-interest target) (err ERR-NO-VAULT)))
+    (max-liquidatable-debt (/ (* (get debt vault) MAX-LIQUIDATION-RATIO) u100))
+    (auction-id (+ (var-get auction-count) u1))
+  )
+    ;; Verify liquidation is needed
+    (asserts! (unwrap! (is-vault-liquidatable target) (err ERR-NO-VAULT)) (err ERR-UNDERCOLLATERALIZED))
+    
+    ;; Ensure we don't liquidate too much
+    (asserts! (<= debt-amount max-liquidatable-debt) (err ERR-LIQUIDATION-TOO-LARGE))
+    (asserts! (is-none (map-get? liquidation-auctions auction-id)) (err ERR-AUCTION-EXISTS))
+    
+    ;; Calculate collateral proportional to debt being liquidated
+    (let (
+      (collateral-ratio (/ (* debt-amount u100) (get debt vault)))
+      (collateral-for-sale (/ (* (get collateral vault) collateral-ratio) u100))
+    )
+      ;; Create auction
+      (map-set liquidation-auctions auction-id {
+        vault-owner: target,
+        debt-to-cover: debt-amount,
+        collateral-for-sale: collateral-for-sale,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height AUCTION-DURATION),
+        highest-bidder: none,
+        highest-bid: u0,
+        is-active: true
+      })
+      
+      (var-set auction-count auction-id)
+      (ok auction-id)
+    )
+  )
+)
+
+(define-public (bid-on-auction (auction-id uint) (bid-amount uint))
+  (let (
+    (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
+    (current-bonus (get-current-auction-bonus auction-id))
+    (debt-value (get debt-to-cover auction))
+    (min-bid (- debt-value (/ (* debt-value current-bonus) u100)))
+  )
+    (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
+    (asserts! (<= stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
+    (asserts! (>= bid-amount min-bid) (err ERR-BID-TOO-LOW))
+    (asserts! (> bid-amount (get highest-bid auction)) (err ERR-BID-TOO-LOW))
+    
+    ;; Return previous highest bid if exists
+    (match (get highest-bidder auction)
+      previous-bidder (try! (contract-call? FLUX-TOKEN transfer (get highest-bid auction) (as-contract tx-sender) previous-bidder none))
+      true
+    )
+    
+    ;; Take new bid
+    (try! (contract-call? FLUX-TOKEN transfer bid-amount tx-sender (as-contract tx-sender) none))
+    
+    ;; Update auction
+    (map-set liquidation-auctions auction-id (merge auction {
+      highest-bidder: (some tx-sender),
+      highest-bid: bid-amount
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (let (
+    (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
+  )
+    (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
+    (asserts! (> stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
+    
+    (match (get highest-bidder auction)
+      winner (begin
+        ;; Burn the FLUX tokens used for bidding
+        (try! (as-contract (contract-call? FLUX-TOKEN burn (get highest-bid auction) tx-sender)))
+        
+        ;; Transfer collateral to winner
+        (try! (as-contract (stx-transfer? (get collateral-for-sale auction) tx-sender winner)))
+        
+        ;; Update vault - reduce debt and collateral
+        (let ((vault (unwrap! (get-vault (get vault-owner auction)) (err ERR-NO-VAULT))))
+          (map-set vaults (get vault-owner auction) {
+            collateral: (- (get collateral vault) (get collateral-for-sale auction)),
+            debt: (- (get debt vault) (get debt-to-cover auction)),
+            last-block: stacks-block-height
+          })
+        )
+        
+        ;; Mark auction as completed
+        (map-set liquidation-auctions auction-id (merge auction {is-active: false}))
+        (ok true)
+      )
+      ;; No bidders - extend auction
+      (begin
+        (map-set liquidation-auctions auction-id (merge auction {
+          end-block: (+ stacks-block-height AUCTION-DURATION)
+        }))
+        (ok false)
+      )
+    )
+  )
+)
+
+;; Public functions (existing functionality maintained)
 
 (define-public (open-vault)
   (begin
@@ -369,11 +688,11 @@
         (collateral-value (unwrap! (get-collateral-value collateral) (err ERR-ARITHMETIC-OVERFLOW)))
       )
       (asserts! (> debt u0) (err ERR-NO-DEBT))
-      (let ((liquidation-threshold (unwrap! (safe-mul debt LIQUIDATION-RATIO) (err ERR-ARITHMETIC-OVERFLOW))))
+      (let ((liquidation-threshold (unwrap! (safe-mul debt (var-get liquidation-ratio)) (err ERR-ARITHMETIC-OVERFLOW))))
         (asserts! (< (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) liquidation-threshold) (err ERR-UNDERCOLLATERALIZED))
         (let (
-            (liquidation-bonus (unwrap! (safe-div (unwrap! (safe-mul collateral LIQUIDATION-BONUS) (err ERR-ARITHMETIC-OVERFLOW)) u100) (err ERR-ARITHMETIC-OVERFLOW)))
-            (collateral-to-liquidator (unwrap! (safe-add collateral liquidation-bonus) (err ERR-ARITHMETIC-OVERFLOW)))
+            (liquidation-bonus-amount (unwrap! (safe-div (unwrap! (safe-mul collateral (var-get liquidation-bonus)) (err ERR-ARITHMETIC-OVERFLOW)) u100) (err ERR-ARITHMETIC-OVERFLOW)))
+            (collateral-to-liquidator (unwrap! (safe-add collateral liquidation-bonus-amount) (err ERR-ARITHMETIC-OVERFLOW)))
           )
           ;; Burn liquidator's FLUX tokens to cover the debt
           (match (contract-call? FLUX-TOKEN burn debt tx-sender)
@@ -385,7 +704,7 @@
                 transfer-success (ok {
                   collateral-seized: collateral,
                   debt-repaid: debt,
-                  bonus: liquidation-bonus
+                  bonus: liquidation-bonus-amount
                 })
                 transfer-error (err ERR-TOKEN-TRANSFER-FAILED)
               )
@@ -423,10 +742,10 @@
 
 (define-read-only (get-system-info)
   {
-    min-collateral-ratio: MIN-COLLATERAL-RATIO,
-    liquidation-ratio: LIQUIDATION-RATIO,
-    liquidation-bonus: LIQUIDATION-BONUS,
-    interest-rate-bp: INTEREST-RATE-BP,
+    min-collateral-ratio: (var-get min-collateral-ratio),
+    liquidation-ratio: (var-get liquidation-ratio),
+    liquidation-bonus: (var-get liquidation-bonus),
+    interest-rate-bp: (var-get interest-rate-bp),
     stx-price: (get-stx-price),
     flux-price: (get-flux-price),
     contract-owner: (get-contract-owner)
@@ -437,7 +756,7 @@
   (begin
     (asserts! (is-valid-amount collateral-amount) (err ERR-INVALID-INPUT))
     (let ((collateral-value (unwrap! (get-collateral-value collateral-amount) (err ERR-ARITHMETIC-OVERFLOW))))
-      (ok (unwrap! (safe-div (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) MIN-COLLATERAL-RATIO) (err ERR-ARITHMETIC-OVERFLOW)))
+      (ok (unwrap! (safe-div (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) (var-get min-collateral-ratio)) (err ERR-ARITHMETIC-OVERFLOW)))
     )
   )
 )
@@ -455,7 +774,7 @@
           (ok false)
           (let (
               (collateral-value (unwrap! (get-collateral-value collateral) (err ERR-ARITHMETIC-OVERFLOW)))
-              (liquidation-threshold (unwrap! (safe-mul debt LIQUIDATION-RATIO) (err ERR-ARITHMETIC-OVERFLOW)))
+              (liquidation-threshold (unwrap! (safe-mul debt (var-get liquidation-ratio)) (err ERR-ARITHMETIC-OVERFLOW)))
             )
             (ok (< (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) liquidation-threshold))
           )
