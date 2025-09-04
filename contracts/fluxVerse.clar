@@ -1,6 +1,6 @@
 ;; FluxVerse CDP (Collateralized Debt Position) Contract
 ;; Allows users to deposit STX as collateral and borrow FLUX tokens
-;; Enhanced with governance and partial liquidation features
+;; Enhanced with governance, partial liquidation features, and emergency controls
 
 ;; Error constants
 (define-constant ERR-NO-VAULT u100)
@@ -29,6 +29,13 @@
 (define-constant ERR-INSUFFICIENT-QUORUM u121)
 (define-constant ERR-PROPOSAL-ALREADY-EXECUTED u122)
 
+;; Emergency system error constants
+(define-constant ERR-SYSTEM-PAUSED u300)
+(define-constant ERR-CIRCUIT-BREAKER-ACTIVE u301)
+(define-constant ERR-EMERGENCY-ONLY u302)
+(define-constant ERR-TIMELOCK-ACTIVE u303)
+(define-constant ERR-OPERATION-NOT-ALLOWED u304)
+
 ;; System parameters (now variables for governance)
 (define-data-var min-collateral-ratio uint u150) ;; 150%
 (define-data-var liquidation-ratio uint u130)    ;; 130%
@@ -48,6 +55,12 @@
 (define-constant MAX-LIQUIDATION-RATIO u50) ;; Max 50% of debt can be liquidated at once
 (define-constant AUCTION-DURATION u72) ;; ~12 hours in blocks
 
+;; Emergency system parameters
+(define-constant TIMELOCK-DELAY u1008) ;; ~1 week
+(define-constant PRICE-VOLATILITY-THRESHOLD u20) ;; 20% price change
+(define-constant MAX-LIQUIDATIONS-PER-BLOCK u10)
+(define-constant DEBT-CEILING u1000000000000) ;; 1M FLUX max total debt
+
 ;; Maximum values to prevent overflow
 (define-constant MAX-UINT u340282366920938463463374607431768211455)
 (define-constant MAX-COLLATERAL u1000000000000000) ;; 1 billion STX max
@@ -64,11 +77,25 @@
 (define-data-var stx-price uint u1000000) ;; $1.00 in micro-dollars (6 decimals)
 (define-data-var flux-price uint u1000000) ;; $1.00 in micro-dollars (6 decimals)
 
+;; Emergency system state variables
+(define-data-var system-paused bool false)
+(define-data-var emergency-mode bool false)
+(define-data-var pause-start-block uint u0)
+(define-data-var emergency-admin principal tx-sender)
+
+;; Circuit breaker states
+(define-data-var price-circuit-breaker bool false)
+(define-data-var liquidation-circuit-breaker bool false)
+(define-data-var debt-circuit-breaker bool false)
+
 ;; Governance data
 (define-data-var proposal-count uint u0)
 
 ;; Liquidation auction data
 (define-data-var auction-count uint u0)
+
+;; Timelock data
+(define-data-var timelock-count uint u0)
 
 ;; Vault data structure
 (define-map vaults principal
@@ -107,6 +134,15 @@
   highest-bidder: (optional principal),
   highest-bid: uint,
   is-active: bool
+})
+
+;; Timelock operations structure
+(define-map timelocked-operations uint {
+  operation: (string-ascii 50),
+  target: principal,
+  value: uint,
+  execution-block: uint,
+  executed: bool
 })
 
 ;; Input validation helpers
@@ -158,6 +194,41 @@
   )
 )
 
+;; Emergency system helper functions
+(define-read-only (is-operation-allowed (operation-type (string-ascii 20)))
+  (and 
+    (not (var-get system-paused))
+    (not (and (is-eq operation-type "borrow") (var-get debt-circuit-breaker)))
+    (not (and (is-eq operation-type "liquidate") (var-get liquidation-circuit-breaker)))
+    (not (and (or (is-eq operation-type "borrow") (is-eq operation-type "liquidate")) 
+              (var-get price-circuit-breaker)))
+  )
+)
+
+(define-private (require-operation-allowed (operation-type (string-ascii 20)))
+  (begin
+    (asserts! (is-operation-allowed operation-type) (err ERR-OPERATION-NOT-ALLOWED))
+    (ok true)
+  )
+)
+
+(define-private (check-price-volatility (old-price uint) (new-price uint))
+  (let (
+    (price-change (if (> new-price old-price) 
+                    (- new-price old-price) 
+                    (- old-price new-price)))
+    (volatility-percent (/ (* price-change u100) old-price))
+  )
+    (if (> volatility-percent PRICE-VOLATILITY-THRESHOLD)
+      (begin
+        (var-set price-circuit-breaker true)
+        (ok false)
+      )
+      (ok true)
+    )
+  )
+)
+
 ;; Governance helper functions
 (define-private (is-valid-parameter (param (string-ascii 32)) (value uint))
   (or 
@@ -183,6 +254,90 @@
         )
       )
     )
+    (ok true)
+  )
+)
+
+;; Emergency system functions
+
+(define-public (emergency-pause)
+  (begin
+    (asserts! (is-eq tx-sender (var-get emergency-admin)) (err ERR-UNAUTHORIZED))
+    (var-set system-paused true)
+    (var-set pause-start-block stacks-block-height)
+    (var-set emergency-mode true)
+    (ok true)
+  )
+)
+
+(define-public (schedule-unpause)
+  (let (
+    (operation-id (+ (var-get timelock-count) u1))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    (asserts! (var-get system-paused) (err ERR-INVALID-INPUT))
+    
+    (map-set timelocked-operations operation-id {
+      operation: "unpause",
+      target: tx-sender,
+      value: u0,
+      execution-block: (+ stacks-block-height TIMELOCK-DELAY),
+      executed: false
+    })
+    
+    (var-set timelock-count operation-id)
+    (ok operation-id)
+  )
+)
+
+(define-public (execute-unpause (operation-id uint))
+  (let (
+    (operation (unwrap! (map-get? timelocked-operations operation-id) (err ERR-INVALID-INPUT)))
+  )
+    (asserts! (is-eq (get operation operation) "unpause") (err ERR-INVALID-INPUT))
+    (asserts! (>= stacks-block-height (get execution-block operation)) (err ERR-TIMELOCK-ACTIVE))
+    (asserts! (not (get executed operation)) (err ERR-INVALID-INPUT))
+    
+    (var-set system-paused false)
+    (var-set emergency-mode false)
+    (map-set timelocked-operations operation-id (merge operation {executed: true}))
+    (ok true)
+  )
+)
+
+(define-public (reset-circuit-breakers)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    (var-set price-circuit-breaker false)
+    (var-set liquidation-circuit-breaker false)
+    (var-set debt-circuit-breaker false)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw-collateral)
+  (begin
+    (asserts! (var-get emergency-mode) (err ERR-EMERGENCY-ONLY))
+    (let ((vault (unwrap! (get-vault tx-sender) (err ERR-NO-VAULT))))
+      (asserts! (> (get collateral vault) u0) (err ERR-NOT-ENOUGH-COLLATERAL))
+      
+      ;; Allow withdrawal of collateral even with debt during emergency
+      (let ((collateral-amount (get collateral vault)))
+        (map-set vaults tx-sender (merge vault {collateral: u0}))
+        (match (as-contract (stx-transfer? collateral-amount tx-sender tx-sender))
+          success (ok collateral-amount)
+          error (err ERR-TOKEN-TRANSFER-FAILED)
+        )
+      )
+    )
+  )
+)
+
+(define-public (set-emergency-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    (asserts! (is-valid-principal new-admin) (err ERR-INVALID-INPUT))
+    (var-set emergency-admin new-admin)
     (ok true)
   )
 )
@@ -248,6 +403,25 @@
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
+)
+
+;; Emergency system read-only functions
+(define-read-only (get-system-status)
+  {
+    system-paused: (var-get system-paused),
+    emergency-mode: (var-get emergency-mode),
+    price-circuit-breaker: (var-get price-circuit-breaker),
+    liquidation-circuit-breaker: (var-get liquidation-circuit-breaker),
+    debt-circuit-breaker: (var-get debt-circuit-breaker),
+    pause-duration: (if (var-get system-paused) 
+                      (- stacks-block-height (var-get pause-start-block)) 
+                      u0),
+    emergency-admin: (var-get emergency-admin)
+  }
+)
+
+(define-read-only (get-timelock-operation (operation-id uint))
+  (map-get? timelocked-operations operation-id)
 )
 
 ;; Governance read-only functions
@@ -365,6 +539,15 @@
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
     (asserts! (is-valid-price new-price) (err ERR-INVALID-INPUT))
+    
+    ;; Check for price volatility and trigger circuit breaker if needed
+    (let ((old-price (get-stx-price)))
+      (if (> old-price u0)
+        (unwrap-panic (check-price-volatility old-price new-price))
+        true
+      )
+    )
+    
     (var-set stx-price new-price)
     (ok true)
   )
@@ -463,115 +646,133 @@
 ;; Enhanced liquidation functions
 
 (define-public (start-partial-liquidation (target principal) (debt-amount uint))
-  (let (
-    (vault (unwrap! (update-vault-interest target) (err ERR-NO-VAULT)))
-    (max-liquidatable-debt (/ (* (get debt vault) MAX-LIQUIDATION-RATIO) u100))
-    (auction-id (+ (var-get auction-count) u1))
-  )
-    ;; Verify liquidation is needed
-    (asserts! (unwrap! (is-vault-liquidatable target) (err ERR-NO-VAULT)) (err ERR-UNDERCOLLATERALIZED))
+  (begin
+    ;; Check if liquidation operations are allowed
+    (try! (require-operation-allowed "liquidate"))
     
-    ;; Ensure we don't liquidate too much
-    (asserts! (<= debt-amount max-liquidatable-debt) (err ERR-LIQUIDATION-TOO-LARGE))
-    (asserts! (is-none (map-get? liquidation-auctions auction-id)) (err ERR-AUCTION-EXISTS))
-    
-    ;; Calculate collateral proportional to debt being liquidated
     (let (
-      (collateral-ratio (/ (* debt-amount u100) (get debt vault)))
-      (collateral-for-sale (/ (* (get collateral vault) collateral-ratio) u100))
+      (vault (unwrap! (update-vault-interest target) (err ERR-NO-VAULT)))
+      (max-liquidatable-debt (/ (* (get debt vault) MAX-LIQUIDATION-RATIO) u100))
+      (auction-id (+ (var-get auction-count) u1))
     )
-      ;; Create auction
-      (map-set liquidation-auctions auction-id {
-        vault-owner: target,
-        debt-to-cover: debt-amount,
-        collateral-for-sale: collateral-for-sale,
-        start-block: stacks-block-height,
-        end-block: (+ stacks-block-height AUCTION-DURATION),
-        highest-bidder: none,
-        highest-bid: u0,
-        is-active: true
-      })
+      ;; Verify liquidation is needed
+      (asserts! (unwrap! (is-vault-liquidatable target) (err ERR-NO-VAULT)) (err ERR-UNDERCOLLATERALIZED))
       
-      (var-set auction-count auction-id)
-      (ok auction-id)
+      ;; Ensure we don't liquidate too much
+      (asserts! (<= debt-amount max-liquidatable-debt) (err ERR-LIQUIDATION-TOO-LARGE))
+      (asserts! (is-none (map-get? liquidation-auctions auction-id)) (err ERR-AUCTION-EXISTS))
+      
+      ;; Calculate collateral proportional to debt being liquidated
+      (let (
+        (collateral-ratio (/ (* debt-amount u100) (get debt vault)))
+        (collateral-for-sale (/ (* (get collateral vault) collateral-ratio) u100))
+      )
+        ;; Create auction
+        (map-set liquidation-auctions auction-id {
+          vault-owner: target,
+          debt-to-cover: debt-amount,
+          collateral-for-sale: collateral-for-sale,
+          start-block: stacks-block-height,
+          end-block: (+ stacks-block-height AUCTION-DURATION),
+          highest-bidder: none,
+          highest-bid: u0,
+          is-active: true
+        })
+        
+        (var-set auction-count auction-id)
+        (ok auction-id)
+      )
     )
   )
 )
 
 (define-public (bid-on-auction (auction-id uint) (bid-amount uint))
-  (let (
-    (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
-    (current-bonus (get-current-auction-bonus auction-id))
-    (debt-value (get debt-to-cover auction))
-    (min-bid (- debt-value (/ (* debt-value current-bonus) u100)))
-  )
-    (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
-    (asserts! (<= stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
-    (asserts! (>= bid-amount min-bid) (err ERR-BID-TOO-LOW))
-    (asserts! (> bid-amount (get highest-bid auction)) (err ERR-BID-TOO-LOW))
+  (begin
+    ;; Check if liquidation operations are allowed
+    (try! (require-operation-allowed "liquidate"))
     
-    ;; Return previous highest bid if exists
-    (match (get highest-bidder auction)
-      previous-bidder (try! (contract-call? FLUX-TOKEN transfer (get highest-bid auction) (as-contract tx-sender) previous-bidder none))
-      true
+    (let (
+      (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
+      (current-bonus (get-current-auction-bonus auction-id))
+      (debt-value (get debt-to-cover auction))
+      (min-bid (- debt-value (/ (* debt-value current-bonus) u100)))
     )
-    
-    ;; Take new bid
-    (try! (contract-call? FLUX-TOKEN transfer bid-amount tx-sender (as-contract tx-sender) none))
-    
-    ;; Update auction
-    (map-set liquidation-auctions auction-id (merge auction {
-      highest-bidder: (some tx-sender),
-      highest-bid: bid-amount
-    }))
-    
-    (ok true)
+      (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
+      (asserts! (<= stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
+      (asserts! (>= bid-amount min-bid) (err ERR-BID-TOO-LOW))
+      (asserts! (> bid-amount (get highest-bid auction)) (err ERR-BID-TOO-LOW))
+      
+      ;; Return previous highest bid if exists
+      (match (get highest-bidder auction)
+        previous-bidder (try! (contract-call? FLUX-TOKEN transfer (get highest-bid auction) (as-contract tx-sender) previous-bidder none))
+        true
+      )
+      
+      ;; Take new bid
+      (try! (contract-call? FLUX-TOKEN transfer bid-amount tx-sender (as-contract tx-sender) none))
+      
+      ;; Update auction
+      (map-set liquidation-auctions auction-id (merge auction {
+        highest-bidder: (some tx-sender),
+        highest-bid: bid-amount
+      }))
+      
+      (ok true)
+    )
   )
 )
 
 (define-public (finalize-auction (auction-id uint))
-  (let (
-    (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
-  )
-    (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
-    (asserts! (> stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
+  (begin
+    ;; Check if liquidation operations are allowed
+    (try! (require-operation-allowed "liquidate"))
     
-    (match (get highest-bidder auction)
-      winner (begin
-        ;; Burn the FLUX tokens used for bidding
-        (try! (as-contract (contract-call? FLUX-TOKEN burn (get highest-bid auction) tx-sender)))
-        
-        ;; Transfer collateral to winner
-        (try! (as-contract (stx-transfer? (get collateral-for-sale auction) tx-sender winner)))
-        
-        ;; Update vault - reduce debt and collateral
-        (let ((vault (unwrap! (get-vault (get vault-owner auction)) (err ERR-NO-VAULT))))
-          (map-set vaults (get vault-owner auction) {
-            collateral: (- (get collateral vault) (get collateral-for-sale auction)),
-            debt: (- (get debt vault) (get debt-to-cover auction)),
-            last-block: stacks-block-height
-          })
+    (let (
+      (auction (unwrap! (map-get? liquidation-auctions auction-id) (err ERR-PROPOSAL-NOT-FOUND)))
+    )
+      (asserts! (get is-active auction) (err ERR-AUCTION-NOT-ACTIVE))
+      (asserts! (> stacks-block-height (get end-block auction)) (err ERR-PROPOSAL-EXPIRED))
+      
+      (match (get highest-bidder auction)
+        winner (begin
+          ;; Burn the FLUX tokens used for bidding
+          (try! (as-contract (contract-call? FLUX-TOKEN burn (get highest-bid auction) tx-sender)))
+          
+          ;; Transfer collateral to winner
+          (try! (as-contract (stx-transfer? (get collateral-for-sale auction) tx-sender winner)))
+          
+          ;; Update vault - reduce debt and collateral
+          (let ((vault (unwrap! (get-vault (get vault-owner auction)) (err ERR-NO-VAULT))))
+            (map-set vaults (get vault-owner auction) {
+              collateral: (- (get collateral vault) (get collateral-for-sale auction)),
+              debt: (- (get debt vault) (get debt-to-cover auction)),
+              last-block: stacks-block-height
+            })
+          )
+          
+          ;; Mark auction as completed
+          (map-set liquidation-auctions auction-id (merge auction {is-active: false}))
+          (ok true)
         )
-        
-        ;; Mark auction as completed
-        (map-set liquidation-auctions auction-id (merge auction {is-active: false}))
-        (ok true)
-      )
-      ;; No bidders - extend auction
-      (begin
-        (map-set liquidation-auctions auction-id (merge auction {
-          end-block: (+ stacks-block-height AUCTION-DURATION)
-        }))
-        (ok false)
+        ;; No bidders - extend auction
+        (begin
+          (map-set liquidation-auctions auction-id (merge auction {
+            end-block: (+ stacks-block-height AUCTION-DURATION)
+          }))
+          (ok false)
+        )
       )
     )
   )
 )
 
-;; Public functions (existing functionality maintained)
+;; Public functions (existing functionality maintained with emergency checks)
 
 (define-public (open-vault)
   (begin
+    ;; Check if system operations are allowed
+    (try! (require-operation-allowed "general"))
+    
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (asserts! (is-none (get-vault tx-sender)) (err ERR-VAULT-EXISTS))
     (map-set vaults tx-sender {
@@ -585,6 +786,9 @@
 
 (define-public (deposit-collateral (amount uint))
   (begin
+    ;; Check if system operations are allowed
+    (try! (require-operation-allowed "general"))
+    
     (asserts! (is-valid-amount amount) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (match (stx-transfer? amount tx-sender (as-contract tx-sender))
@@ -605,6 +809,9 @@
 
 (define-public (withdraw-collateral (amount uint))
   (begin
+    ;; Check if system operations are allowed
+    (try! (require-operation-allowed "general"))
+    
     (asserts! (is-valid-amount amount) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let ((vault (unwrap! (update-vault-interest tx-sender) (err ERR-NO-VAULT))))
@@ -627,6 +834,9 @@
 
 (define-public (borrow (amount uint))
   (begin
+    ;; Check if borrow operations are allowed
+    (try! (require-operation-allowed "borrow"))
+    
     (asserts! (is-valid-debt-amount amount) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let (
@@ -651,6 +861,9 @@
 
 (define-public (repay (amount uint))
   (begin
+    ;; Check if system operations are allowed
+    (try! (require-operation-allowed "general"))
+    
     (asserts! (is-valid-debt-amount amount) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let (
@@ -678,6 +891,9 @@
 
 (define-public (liquidate (target principal))
   (begin
+    ;; Check if liquidation operations are allowed
+    (try! (require-operation-allowed "liquidate"))
+    
     (asserts! (is-valid-principal target) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (asserts! (not (is-eq target tx-sender)) (err ERR-INVALID-INPUT))
@@ -721,6 +937,9 @@
 
 (define-public (close-vault)
   (begin
+    ;; Check if system operations are allowed
+    (try! (require-operation-allowed "general"))
+    
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let ((vault (unwrap! (update-vault-interest tx-sender) (err ERR-NO-VAULT))))
       (asserts! (is-eq (get debt vault) u0) (err ERR-NO-DEBT))
@@ -748,7 +967,8 @@
     interest-rate-bp: (var-get interest-rate-bp),
     stx-price: (get-stx-price),
     flux-price: (get-flux-price),
-    contract-owner: (get-contract-owner)
+    contract-owner: (get-contract-owner),
+    system-status: (get-system-status)
   }
 )
 
