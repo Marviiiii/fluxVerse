@@ -318,13 +318,14 @@
 (define-public (emergency-withdraw-collateral)
   (begin
     (asserts! (var-get emergency-mode) (err ERR-EMERGENCY-ONLY))
-    (let ((vault (unwrap! (get-vault tx-sender) (err ERR-NO-VAULT))))
+    (let ((vault (unwrap! (get-vault tx-sender) (err ERR-NO-VAULT)))
+          (recipient tx-sender))
       (asserts! (> (get collateral vault) u0) (err ERR-NOT-ENOUGH-COLLATERAL))
       
       ;; Allow withdrawal of collateral even with debt during emergency
       (let ((collateral-amount (get collateral vault)))
         (map-set vaults tx-sender (merge vault {collateral: u0}))
-        (match (as-contract (stx-transfer? collateral-amount tx-sender tx-sender))
+        (match (as-contract (stx-transfer? collateral-amount tx-sender recipient))
           success (ok collateral-amount)
           error (err ERR-TOKEN-TRANSFER-FAILED)
         )
@@ -567,7 +568,7 @@
 (define-public (propose (parameter (string-ascii 32)) (new-value uint))
   (let (
     (proposal-id (+ (var-get proposal-count) u1))
-    (proposer-balance (contract-call? FLUX-TOKEN get-balance tx-sender))
+    (proposer-balance (contract-call? .fluxtoken get-balance tx-sender))
   )
     (asserts! (>= proposer-balance PROPOSAL-THRESHOLD) (err ERR-INSUFFICIENT-VOTING-POWER))
     (asserts! (is-valid-parameter parameter new-value) (err ERR-INVALID-INPUT))
@@ -591,7 +592,7 @@
 (define-public (vote (proposal-id uint) (support bool) (amount uint))
   (let (
     (proposal (unwrap! (map-get? proposals proposal-id) (err ERR-PROPOSAL-NOT-FOUND)))
-    (voter-balance (contract-call? FLUX-TOKEN get-balance tx-sender))
+    (voter-balance (contract-call? .fluxtoken get-balance tx-sender))
   )
     (asserts! (<= stacks-block-height (get end-block proposal)) (err ERR-PROPOSAL-EXPIRED))
     (asserts! (>= voter-balance amount) (err ERR-INSUFFICIENT-VOTING-POWER))
@@ -704,12 +705,12 @@
       
       ;; Return previous highest bid if exists
       (match (get highest-bidder auction)
-        previous-bidder (try! (contract-call? FLUX-TOKEN transfer (get highest-bid auction) (as-contract tx-sender) previous-bidder none))
+        previous-bidder (try! (contract-call? .fluxtoken transfer (get highest-bid auction) (as-contract tx-sender) previous-bidder none))
         true
       )
       
       ;; Take new bid
-      (try! (contract-call? FLUX-TOKEN transfer bid-amount tx-sender (as-contract tx-sender) none))
+      (try! (contract-call? .fluxtoken transfer bid-amount tx-sender (as-contract tx-sender) none))
       
       ;; Update auction
       (map-set liquidation-auctions auction-id (merge auction {
@@ -736,7 +737,7 @@
       (match (get highest-bidder auction)
         winner (begin
           ;; Burn the FLUX tokens used for bidding
-          (try! (as-contract (contract-call? FLUX-TOKEN burn (get highest-bid auction) tx-sender)))
+          (try! (as-contract (contract-call? .fluxtoken burn (get highest-bid auction) tx-sender)))
           
           ;; Transfer collateral to winner
           (try! (as-contract (stx-transfer? (get collateral-for-sale auction) tx-sender winner)))
@@ -816,14 +817,15 @@
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let ((vault (unwrap! (update-vault-interest tx-sender) (err ERR-NO-VAULT))))
       (asserts! (>= (get collateral vault) amount) (err ERR-NOT-ENOUGH-COLLATERAL))
-      (let ((new-collateral (unwrap! (safe-sub (get collateral vault) amount) (err ERR-ARITHMETIC-OVERFLOW))))
+      (let ((new-collateral (unwrap! (safe-sub (get collateral vault) amount) (err ERR-ARITHMETIC-OVERFLOW)))
+            (recipient tx-sender))
         (asserts! (unwrap! (check-collateral-ratio new-collateral (get debt vault)) (err ERR-ARITHMETIC-OVERFLOW)) (err ERR-BAD-RATIO))
         (map-set vaults tx-sender {
           collateral: new-collateral,
           debt: (get debt vault),
           last-block: stacks-block-height
         })
-        (match (as-contract (stx-transfer? amount tx-sender tx-sender))
+        (match (as-contract (stx-transfer? amount tx-sender recipient))
           success (ok true)
           error (err ERR-TOKEN-TRANSFER-FAILED)
         )
@@ -840,6 +842,7 @@
     (asserts! (is-valid-debt-amount amount) (err ERR-INVALID-INPUT))
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let (
+        (borrower tx-sender)
         (vault (unwrap! (update-vault-interest tx-sender) (err ERR-NO-VAULT)))
         (new-debt (unwrap! (safe-add (get debt vault) amount) (err ERR-ARITHMETIC-OVERFLOW)))
       )
@@ -851,7 +854,7 @@
         last-block: stacks-block-height
       })
       ;; Mint FLUX tokens to the borrower
-      (match (as-contract (contract-call? FLUX-TOKEN mint amount tx-sender))
+      (match (as-contract (contract-call? .fluxtoken mint amount borrower))
         success (ok true)
         error (err ERR-TOKEN-TRANSFER-FAILED)
       )
@@ -872,7 +875,7 @@
       )
       (asserts! (> repay-amount u0) (err ERR-NO-DEBT))
       ;; Burn FLUX tokens from the borrower
-      (match (contract-call? FLUX-TOKEN burn repay-amount tx-sender)
+      (match (contract-call? .fluxtoken burn repay-amount tx-sender)
         success (begin
           (let ((new-debt (unwrap! (safe-sub (get debt vault) repay-amount) (err ERR-ARITHMETIC-OVERFLOW))))
             (map-set vaults tx-sender {
@@ -908,19 +911,20 @@
         (asserts! (< (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) liquidation-threshold) (err ERR-UNDERCOLLATERALIZED))
         (let (
             (liquidation-bonus-amount (unwrap! (safe-div (unwrap! (safe-mul collateral (var-get liquidation-bonus)) (err ERR-ARITHMETIC-OVERFLOW)) u100) (err ERR-ARITHMETIC-OVERFLOW)))
-            (collateral-to-liquidator (unwrap! (safe-add collateral liquidation-bonus-amount) (err ERR-ARITHMETIC-OVERFLOW)))
+            (collateral-to-liquidator collateral)
+            (liquidator tx-sender)
           )
           ;; Burn liquidator's FLUX tokens to cover the debt
-          (match (contract-call? FLUX-TOKEN burn debt tx-sender)
+          (match (contract-call? .fluxtoken burn debt tx-sender)
             success (begin
               ;; Delete the vault
               (map-delete vaults target)
               ;; Transfer collateral + bonus to liquidator
-              (match (as-contract (stx-transfer? collateral-to-liquidator tx-sender tx-sender))
+              (match (as-contract (stx-transfer? collateral-to-liquidator tx-sender liquidator))
                 transfer-success (ok {
-                  collateral-seized: collateral,
+                  collateral-seized: collateral-to-liquidator,
                   debt-repaid: debt,
-                  bonus: liquidation-bonus-amount
+                  bonus: u0
                 })
                 transfer-error (err ERR-TOKEN-TRANSFER-FAILED)
               )
@@ -943,10 +947,11 @@
     (asserts! (is-valid-principal tx-sender) (err ERR-INVALID-INPUT))
     (let ((vault (unwrap! (update-vault-interest tx-sender) (err ERR-NO-VAULT))))
       (asserts! (is-eq (get debt vault) u0) (err ERR-NO-DEBT))
-      (let ((collateral (get collateral vault)))
+      (let ((collateral (get collateral vault))
+            (recipient tx-sender))
         (map-delete vaults tx-sender)
         (if (> collateral u0)
-            (match (as-contract (stx-transfer? collateral tx-sender tx-sender))
+            (match (as-contract (stx-transfer? collateral tx-sender recipient))
               success (ok collateral)
               error (err ERR-TOKEN-TRANSFER-FAILED)
             )
@@ -998,9 +1003,4 @@
             )
             (ok (< (unwrap! (safe-mul collateral-value u100) (err ERR-ARITHMETIC-OVERFLOW)) liquidation-threshold))
           )
-        )
-      )
-      (err ERR-NO-VAULT)
-    )
-  )
-)
+ 
