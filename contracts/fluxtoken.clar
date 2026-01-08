@@ -20,6 +20,9 @@
 ;; Contract owner (initially the deployer, can be changed to CDP contract)
 (define-data-var contract-owner principal tx-sender)
 
+;; Dedicated minter role (initially the deployer, should be set to CDP contract)
+(define-data-var minter principal tx-sender)
+
 ;; Token data
 (define-data-var total-supply uint u0)
 (define-map balances principal uint)
@@ -146,11 +149,13 @@
   )
 )
 
-;; CDP-specific functions (mint/burn)
+;; CDP-specific functions (mint/burn) - Enhanced with minter role
 
 (define-public (mint (amount uint) (recipient principal))
   (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    ;; Allow either contract-owner or designated minter to mint
+    (asserts! (or (is-eq tx-sender (var-get contract-owner)) 
+                  (is-eq tx-sender (var-get minter))) (err ERR-UNAUTHORIZED))
     (asserts! (is-valid-amount amount) (err ERR-INVALID-AMOUNT))
     (asserts! (is-valid-principal recipient) (err ERR-INVALID-PRINCIPAL))
     
@@ -161,7 +166,7 @@
         (asserts! (<= new-supply MAX-SUPPLY) (err ERR-INVALID-AMOUNT))
         (map-set balances recipient new-balance)
         (var-set total-supply new-supply)
-        (print {action: "mint", recipient: recipient, amount: amount})
+        (print {action: "mint", recipient: recipient, amount: amount, minter: tx-sender})
         (ok true)
       )
     )
@@ -170,7 +175,10 @@
 
 (define-public (burn (amount uint) (sender principal))
   (begin
-    (asserts! (or (is-eq tx-sender sender) (is-eq tx-sender (var-get contract-owner))) (err ERR-UNAUTHORIZED))
+    ;; Allow the token holder, contract owner, or designated minter to burn
+    (asserts! (or (is-eq tx-sender sender)
+                  (is-eq tx-sender (var-get contract-owner))
+                  (is-eq tx-sender (var-get minter))) (err ERR-UNAUTHORIZED))
     (asserts! (is-valid-amount amount) (err ERR-INVALID-AMOUNT))
     (asserts! (is-valid-principal sender) (err ERR-INVALID-PRINCIPAL))
     
@@ -180,7 +188,7 @@
             (new-supply (unwrap! (safe-sub current-supply amount) (err ERR-INSUFFICIENT-BALANCE))))
         (map-set balances sender new-balance)
         (var-set total-supply new-supply)
-        (print {action: "burn", sender: sender, amount: amount})
+        (print {action: "burn", sender: sender, amount: amount, burner: tx-sender})
         (ok true)
       )
     )
@@ -203,8 +211,37 @@
   )
 )
 
+(define-public (set-minter (new-minter principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    (asserts! (is-valid-principal new-minter) (err ERR-INVALID-PRINCIPAL))
+    
+    (let ((old-minter (var-get minter)))
+      (var-set minter new-minter)
+      (print {action: "set-minter", old-minter: old-minter, new-minter: new-minter})
+      (ok true)
+    )
+  )
+)
+
+(define-public (revoke-minter)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-UNAUTHORIZED))
+    
+    (let ((old-minter (var-get minter)))
+      (var-set minter (var-get contract-owner))  ;; Reset minter to owner
+      (print {action: "revoke-minter", old-minter: old-minter, new-minter: (var-get contract-owner)})
+      (ok true)
+    )
+  )
+)
+
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
+)
+
+(define-read-only (get-minter)
+  (var-get minter)
 )
 
 ;; Utility functions for testing
@@ -236,7 +273,8 @@
     symbol: TOKEN-SYMBOL,
     decimals: TOKEN-DECIMALS,
     total-supply: (var-get total-supply),
-    contract-owner: (var-get contract-owner)
+    contract-owner: (var-get contract-owner),
+    minter: (var-get minter)
   }
 )
 
@@ -253,4 +291,12 @@
       total-supply: (var-get total-supply)
     }
   )
+)
+
+(define-read-only (get-roles-info)
+  {
+    contract-owner: (var-get contract-owner),
+    minter: (var-get minter),
+    caller: tx-sender
+  }
 )
